@@ -37,6 +37,37 @@ class MetricDefService:
     def get_entry(self, entry_id: int) -> dict[str, Any] | None:
         return store.find(MODULE, entry_id)
 
+    def significance_inputs(self) -> list[dict[str, Any]]:
+        """跨模块联动：读取分群对比结果表的指标编号与精度位数，复算显著性输入。
+
+        结果表落库时已按指标定义的精度位数写入均值与差异；这里按同一精度
+        重算均值差与差异方向，供指标定义侧核对显著性输入是否一致。
+        """
+        rows = store.rows("segment_compare_result")
+        rechecked: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                precision = max(0, int(str(row.get("精度位数", "3")).strip()))
+            except Exception:
+                precision = 3
+            try:
+                mean_a = round(float(row.get("指标值", 0.0)), precision)
+                mean_b = round(float(row.get("对比基准", 0.0)), precision)
+            except Exception:
+                continue
+            diff = round(mean_a - mean_b, precision)
+            rechecked.append({
+                "指标编号": row.get("指标编号", ""),
+                "任务编号": row.get("任务编号", ""),
+                "精度位数": precision,
+                "均值A": mean_a,
+                "均值B": mean_b,
+                "差异": diff,
+                "差异方向": "上升" if diff > 0 else ("下降" if diff < 0 else "持平"),
+                "显著性": row.get("显著性", ""),
+            })
+        return rechecked
+
     def create_entry(self, values: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
         missing = [field for field in REQUIRED_FIELDS if not str(values.get(field) or "").strip()]
         if missing:

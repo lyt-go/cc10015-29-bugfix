@@ -1,12 +1,15 @@
-"""分群对比 分析看板接口：汇总指标、参数运行与结果导出。"""
+"""分群对比接口：对比任务列表、运行分析、结果表落库查询与状态流转。
+
+列表、详情、导出与消费端全量结果表都读同一份落库数据（segment_compare_result），
+差异方向与显著性基于同一对分群的同一成员集合，不会出现对不上的情况。
+"""
 from __future__ import annotations
 
 import csv
 import io
-import random
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload
@@ -27,22 +30,33 @@ def csv_cell(value: Any) -> str:
 
 @router.get("/summary")
 def get_summary() -> dict[str, Any]:
-    return {"metrics": [
-        {"label": "覆盖数据源", "value": random.randint(12, 45), "trend": random.randint(-12, 25)},
-        {"label": "最新指标值", "value": round(random.uniform(0.72, 0.99), 3), "trend": random.randint(-8, 15)},
-        {"label": "异常记录", "value": random.randint(0, 8), "trend": -random.randint(1, 10)},
-    ]}
+    return {"metrics": service.summary()}
 
 
 @router.get("")
 def list_results() -> dict[str, Any]:
-    return {"items": service.list_results()}
+    items = service.list_results()
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/results")
+def get_result_table() -> dict[str, Any]:
+    """消费端取全量分群对比结果表：结果确认后消费的就是这份落库数据。"""
+    items = service.result_table()
+    return {"items": items, "total": len(items)}
 
 
 @router.post("/run")
 def run_analysis(payload: EntryPayload) -> dict[str, Any]:
-    results = service.run_analysis(payload.values)
-    return {"items": results}
+    rows = service.run_analysis(payload.values)
+    return {"items": rows, "total": len(rows)}
+
+
+@router.post("/recover")
+def recover_failed() -> dict[str, Any]:
+    """恢复计算：只重算上次失败的受影响任务，其余结果保持不动。"""
+    rows, failed = service.recover_failed()
+    return {"items": rows, "total": len(rows), "failed": failed}
 
 
 @router.get("/export")
@@ -67,3 +81,12 @@ def get_entry(entry_id: int) -> dict:
     if entry is None:
         raise HTTPException(status_code=404, detail=f"对比任务 {entry_id} 不存在")
     return entry
+
+
+@router.post("/{entry_id}/actions", response_model=ActionResult)
+def run_action(entry_id: int, payload: ActionPayload) -> ActionResult:
+    """开始计算会重算该任务并落库；确认完成后结果表交消费端全量读取。"""
+    entry, message = service.run_action(entry_id, payload.action.strip())
+    if entry is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=entry)

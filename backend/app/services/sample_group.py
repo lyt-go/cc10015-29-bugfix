@@ -1,6 +1,7 @@
 """样本分群业务规则：提供分群人员列表供AB分析消费。"""
 from __future__ import annotations
 
+import random
 import time
 from typing import Any
 
@@ -39,7 +40,11 @@ class SampleGroupService:
         return store.find(MODULE, entry_id)
 
     def get_group_members(self, group_id: int) -> list[dict[str, Any]]:
-        """生成分群的模拟用户列表，供AB分析消费。"""
+        """分群成员明细：按分群确定性生成，保证多次读取拿到同一成员集合。
+
+        成员从共享用户池抽样，不同分群的成员集合可能部分重叠，
+        由消费方（如分群对比）决定排除重叠还是按分群归属分别汇总。
+        """
         sg = self.get_entry(group_id)
         if sg is None:
             return []
@@ -47,16 +52,22 @@ class SampleGroupService:
             base = int(sg.get("样本基数", 1000))
         except Exception:
             base = 1000
-        members: list[dict] = []
+        count = min(base, 500)  # 上限500避免内存爆炸
+        # 成员集合按分群播种：同一分群每次抽中同一批用户
+        member_rng = random.Random(f"sample_group_members:{group_id}")
+        pool_size = max(base * 4, 2000)
+        indices = sorted(member_rng.sample(range(pool_size), count))
+        # 指标值按分群另起一条随机流，与成员抽样互不影响
+        value_rng = random.Random(f"sample_group_values:{group_id}")
         group_type = sg.get("group_type", "control")
-        for i in range(min(base, 500)):  # 上限500避免内存爆炸
-            user_id = f"U{group_id}{i:04d}"
+        members: list[dict] = []
+        for idx in indices:
+            user_id = f"U{idx:06d}"
             # 实验组用户指标值偏高，对照组偏低，形成可检测差异
-            import random
             if group_type == "experiment":
-                value = random.gauss(mu=0.62, sigma=0.08)
+                value = value_rng.gauss(mu=0.62, sigma=0.08)
             else:
-                value = random.gauss(mu=0.55, sigma=0.08)
+                value = value_rng.gauss(mu=0.55, sigma=0.08)
             members.append({
                 "user_id": user_id,
                 "group_id": group_id,

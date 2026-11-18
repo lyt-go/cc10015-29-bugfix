@@ -152,3 +152,123 @@ def test_metric_alias_version():
     })
     assert entry is not None, ms
 
+
+def _make_compare_task(task_id=1, group_a="A", group_b="B", code="SEGM-T001"):
+    """直接往数据仓库登记一条对比任务。"""
+    task = {
+        "id": task_id, "status": "草稿", "pending": True, "abnormal": False,
+        "任务编号": code, "分群A": group_a, "分群B": group_b, "对比指标": "点击率",
+        "时间范围": "最近7天", "差异阈值": "0.01", "显著性水平": "0.05", "比较方法": "绝对值",
+    }
+    store.rows("segment_compare").append(task)
+    return task
+
+
+def _make_group(group_id, code, base="300", group_type="control"):
+    store.rows("sample_group").append({
+        "id": group_id, "status": "已就绪", "pending": False, "abnormal": False,
+        "分群编号": code, "分群名称": code, "筛选条件": "", "样本基数": base,
+        "分群日期": "2026-11-01", "更新方式": "手工", "有效天数": "14", "负责人": "tester",
+        "group_type": group_type,
+    })
+
+
+def test_segment_compare_deterministic_and_consistent():
+    """同一成员集合计算：两次列表一致，差异方向与均值关系一致，列表与详情同源。"""
+    _clear_all()
+    _make_group(1, "SG-A", group_type="experiment")
+    _make_group(2, "SG-B", group_type="control")
+    _make_compare_task(1, "SG-A", "SG-B")
+    sc = SegmentCompareService()
+    first = sc.list_results()
+    second = sc.list_results()
+    assert first == second, "结果表落库后两次读取必须一致"
+    row = first[0]
+    assert abs(row["差异"] - round(row["指标值"] - row["对比基准"], row["精度位数"])) < 1e-9
+    if row["差异"] > 0:
+        assert row["差异方向"] == "上升"
+    elif row["差异"] < 0:
+        assert row["差异方向"] == "下降"
+    else:
+        assert row["差异方向"] == "持平"
+    if row["显著性"] == "显著":
+        assert row["差异方向"] in ("上升", "下降"), "显著但无方向是矛盾结果"
+    detail = sc.get_entry(1)
+    for key in ("指标值", "对比基准", "差异", "差异方向", "显著性", "重叠处理"):
+        assert detail[key] == row[key], f"列表与详情字段 {key} 不一致"
+
+
+def test_segment_compare_overlap_strategies():
+    """部分重叠：排除重叠给出独立成员差异和排除数量；保留重叠给出各自汇总并单列重叠影响。"""
+    _clear_all()
+    _make_group(1, "SG-A", base="500")
+    _make_group(2, "SG-B", base="500")
+    _make_compare_task(1, "SG-A", "SG-B")
+    sc = SegmentCompareService()
+    rows, failed = sc.compute_results(overlap_strategy="排除重叠")
+    assert not failed
+    row = rows[0]
+    assert row["重叠处理"] == "排除重叠"
+    assert row["重叠成员数"] > 0, "共享用户池下两分群应存在部分重叠"
+    assert row["排除数量"] == 2 * row["重叠成员数"]
+    assert row["样本数A"] == 500 - row["重叠成员数"]
+    rows2, failed2 = sc.compute_results(overlap_strategy="保留重叠")
+    assert not failed2
+    row2 = rows2[0]
+    assert row2["重叠处理"] == "保留重叠"
+    assert row2["排除数量"] == 0
+    assert row2["样本数A"] == 500 and row2["样本数B"] == 500
+    assert row2["重叠成员影响"] != "", "保留重叠需单列重叠成员影响"
+
+
+def test_segment_compare_failure_keeps_last_and_recovers():
+    """计算失败保留上一完整对比；恢复时只重算受影响任务。"""
+    _clear_all()
+    _make_group(1, "SG-A", group_type="experiment")
+    _make_group(2, "SG-B", group_type="control")
+    _make_group(3, "SG-EMPTY", base="0")
+    _make_compare_task(1, "SG-A", "SG-B")
+    _make_compare_task(2, "SG-A", "SG-B", code="SEGM-T002")
+    sc = SegmentCompareService()
+    rows, failed = sc.compute_results()
+    assert not failed and len(rows) == 2
+    good = dict(sc._find_result(1))
+    # 让任务1的分群A变成空分群 → 计算失败
+    task1 = store.find("segment_compare", 1)
+    task1["分群A"] = "SG-EMPTY"
+    rows2, failed2 = sc.compute_results(task_ids=[1, 2])
+    assert failed2 == [1]
+    assert sc._find_result(1) == good, "失败任务应保留上一完整对比"
+    # 恢复：只重算受影响任务
+    task1["分群A"] = "SG-A"
+    recovered, failed3 = sc.recover_failed()
+    assert failed3 == []
+    assert [r["task_id"] for r in recovered] == [1]
+    assert sc._find_result(1)["计算状态"] == "成功"
+
+
+def test_metric_def_reads_compare_result_table():
+    """跨模块联动：指标定义读取结果表的指标编号与精度位数，复算显著性输入。"""
+    _clear_all()
+    md = MetricDefService()
+    md.create_entry({
+        "指标编号": "M-001", "指标名称": "点击率", "计算公式": "c/i",
+        "统计粒度": "日", "时间窗口": "7", "基准取值": "0.5", "精度位数": "4", "口径版本": "v1",
+    })
+    _make_group(1, "SG-A", group_type="experiment")
+    _make_group(2, "SG-B", group_type="control")
+    _make_compare_task(1, "SG-A", "SG-B")
+    sc = SegmentCompareService()
+    sc.compute_results()
+    result = sc._find_result(1)
+    assert result["指标编号"] == "M-001"
+    assert result["精度位数"] == 4
+    inputs = md.significance_inputs()
+    assert len(inputs) == 1
+    item = inputs[0]
+    assert item["指标编号"] == "M-001"
+    assert item["差异"] == round(item["均值A"] - item["均值B"], 4)
+    assert item["差异方向"] == result["差异方向"]
+    assert item["显著性"] == result["显著性"]
+
+
